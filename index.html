@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Spatial Sound Tracker</title>
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: #050505;
+        color: white;
+        font-family: Arial, Helvetica, sans-serif;
+        overflow: hidden;
+      }
+
+      #app {
+        width: 100vw;
+        height: 100vh;
+
+        position: relative;
+
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      #video {
+        position: absolute;
+
+        width: 320px;
+        height: 240px;
+
+        right: 20px;
+        bottom: 20px;
+
+        object-fit: cover;
+
+        opacity: 0.3;
+
+        transform: scaleX(-1);
+
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+
+      #info {
+        position: absolute;
+
+        top: 30px;
+        left: 30px;
+
+        z-index: 20;
+
+        line-height: 1.6;
+      }
+
+      #state {
+        font-size: 38px;
+        font-weight: bold;
+
+        margin-bottom: 10px;
+      }
+
+      .data {
+        opacity: 0.55;
+      }
+
+      #mainVisual {
+        width: 250px;
+        height: 250px;
+
+        border-radius: 50%;
+
+        background: white;
+
+        opacity: 0.2;
+
+        transition:
+          transform 0.15s linear,
+          opacity 0.15s linear;
+      }
+
+      #startButton {
+        position: absolute;
+
+        z-index: 100;
+
+        padding: 18px 30px;
+
+        border: none;
+        border-radius: 100px;
+
+        background: white;
+        color: black;
+
+        font-size: 18px;
+
+        cursor: pointer;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="app">
+      <button id="startButton">START</button>
+
+      <div id="info">
+        <div id="state">WAITING</div>
+
+        <div id="depthText" class="data">Depth: 0</div>
+
+        <div id="xText" class="data">Horizontal: 0</div>
+
+        <div id="centerText" class="data">Distance from centre: 0</div>
+
+        <div id="pitchText" class="data">Pitch: 1.00x</div>
+      </div>
+
+      <div id="mainVisual"></div>
+
+      <video id="video" autoplay muted playsinline></video>
+    </div>
+
+    <!-- MEDIAPIPE -->
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+    <script>
+      //
+      // ==========================================
+      // ELEMENTS
+      // ==========================================
+      //
+
+      const video = document.getElementById("video");
+
+      const startButton = document.getElementById("startButton");
+
+      const stateText = document.getElementById("state");
+
+      const depthText = document.getElementById("depthText");
+
+      const xText = document.getElementById("xText");
+
+      const centerText = document.getElementById("centerText");
+
+      const pitchText = document.getElementById("pitchText");
+
+      const visual = document.getElementById("mainVisual");
+
+      //
+      // ==========================================
+      // AUDIO FILES
+      // ==========================================
+      //
+
+      const audio = {
+        left: new Audio("sounds/left.wav"),
+
+        center: new Audio("sounds/center.wav"),
+
+        right: new Audio("sounds/right.wav"),
+      };
+
+      Object.values(audio).forEach((sound) => {
+        sound.loop = true;
+
+        sound.volume = 1;
+
+        // allow pitch to move with playback rate
+
+        sound.preservesPitch = false;
+      });
+
+      //
+      // ==========================================
+      // WEB AUDIO
+      // ==========================================
+      //
+
+      let audioContext;
+
+      let leftSource;
+      let centerSource;
+      let rightSource;
+
+      let leftGain;
+      let centerGain;
+      let rightGain;
+
+      let leftPan;
+      let centerPan;
+      let rightPan;
+
+      let delayNode;
+      let delayFeedback;
+      let delayGain;
+
+      let masterGain;
+
+      //
+      // ==========================================
+      // INTERACTION STATE
+      // ==========================================
+      //
+
+      let interactionStarted = false;
+
+      let interactionEnded = false;
+
+      let lastBodySeen = 0;
+
+      let bodyPresent = false;
+
+      const leaveDelay = 3000;
+
+      // memory of interaction
+
+      let maximumDepth = 0;
+
+      let accumulatedEdgeDistance = 0;
+
+      let interactionFrames = 0;
+
+      //
+      // ==========================================
+      // TRACKING SMOOTHING
+      // ==========================================
+      //
+
+      let smoothX = 0.5;
+
+      let smoothDepth = 0.15;
+
+      const smoothing = 0.1;
+
+      //
+      // ==========================================
+      // HELPERS
+      // ==========================================
+      //
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function mapValue(value, inMin, inMax, outMin, outMax) {
+        return outMin + ((value - inMin) / (inMax - inMin)) * (outMax - outMin);
+      }
+
+      //
+      // ==========================================
+      // SMOOTH AUDIO CHANGES
+      // ==========================================
+      //
+
+      function smoothGain(gainNode, value, speed = 0.15) {
+        if (!audioContext) return;
+
+        const now = audioContext.currentTime;
+
+        gainNode.gain.cancelScheduledValues(now);
+
+        gainNode.gain.setTargetAtTime(value, now, speed);
+      }
+
+      //
+      // ==========================================
+      // STATE 1
+      // ORIGINAL / UNCHANGED
+      // ==========================================
+      //
+
+      function setOriginalState() {
+        if (!audioContext) return;
+
+        stateText.innerText = "ORIGINAL";
+
+        // centre is the original environment
+
+        smoothGain(centerGain, 0.45, 0.8);
+
+        smoothGain(leftGain, 0, 0.8);
+
+        smoothGain(rightGain, 0, 0.8);
+
+        // clean / original sound
+
+        audio.center.playbackRate = 1;
+
+        delayFeedback.gain.setTargetAtTime(0.05, audioContext.currentTime, 0.5);
+
+        delayGain.gain.setTargetAtTime(0.04, audioContext.currentTime, 0.5);
+      }
+
+      //
+      // ==========================================
+      // STATE 2
+      // ACTIVE INTERACTION
+      // ==========================================
+      //
+
+      function updateInteractionAudio(bodyX, depth) {
+        if (!audioContext) return;
+
+        //
+        // NORMALISE DEPTH
+        //
+
+        const depthAmount = clamp(
+          mapValue(depth, 0.12, 0.5, 0, 1),
+
+          0,
+          1,
+        );
+
+        //
+        // DISTANCE FROM CENTRE
+        //
+
+        const edgeDistance = clamp(
+          Math.abs(bodyX - 0.5) / 0.5,
+
+          0,
+          1,
+        );
+
+        //
+        // STORE "MEMORY"
+        //
+
+        maximumDepth = Math.max(maximumDepth, depthAmount);
+
+        accumulatedEdgeDistance += edgeDistance;
+
+        interactionFrames++;
+
+        //
+        // HORIZONTAL AUDIO CROSSFADE
+        //
+
+        let leftWeight = 0;
+
+        let centerWeight = 0;
+
+        let rightWeight = 0;
+
+        if (bodyX < 0.5) {
+          const amount = bodyX / 0.5;
+
+          leftWeight = 1 - amount;
+
+          centerWeight = amount;
+        } else {
+          const amount = (bodyX - 0.5) / 0.5;
+
+          centerWeight = 1 - amount;
+
+          rightWeight = amount;
+        }
+
+        //
+        // KEEP CENTER PRESENT
+        //
+        // this is important:
+        // center.wav never completely disappears
+        //
+
+        centerWeight = Math.max(centerWeight, 0.18);
+
+        //
+        // DEPTH = INTENSITY
+        //
+
+        const intensity = mapValue(depthAmount, 0, 1, 0.45, 1);
+
+        //
+        // APPLY CROSSFADE
+        //
+
+        smoothGain(leftGain, leftWeight * intensity, 0.12);
+
+        smoothGain(centerGain, centerWeight * intensity, 0.12);
+
+        smoothGain(rightGain, rightWeight * intensity, 0.12);
+
+        //
+        // PITCH
+        //
+        // subtle enough that it doesn't go insane
+        //
+
+        let playbackRate = 0.96 + depthAmount * 0.16 + edgeDistance * 0.07;
+
+        playbackRate = clamp(playbackRate, 0.95, 1.2);
+
+        audio.left.playbackRate = playbackRate;
+
+        audio.center.playbackRate = playbackRate;
+
+        audio.right.playbackRate = playbackRate;
+
+        //
+        // IMMERSIVE DELAY
+        //
+        // closer / further from centre =
+        // more space and echo
+        //
+
+        const feedback = 0.08 + depthAmount * 0.16 + edgeDistance * 0.12;
+
+        delayFeedback.gain.setTargetAtTime(
+          clamp(feedback, 0.08, 0.35),
+
+          audioContext.currentTime,
+
+          0.15,
+        );
+
+        const wet = 0.06 + depthAmount * 0.12;
+
+        delayGain.gain.setTargetAtTime(
+          wet,
+
+          audioContext.currentTime,
+
+          0.15,
+        );
+
+        //
+        // DISPLAY
+        //
+
+        pitchText.innerText = "Pitch: " + playbackRate.toFixed(2) + "x";
+      }
+
+      //
+      // ==========================================
+      // STATE 3
+      // CHANGED ROOM
+      // ==========================================
+      //
+
+      function setChangedState() {
+        if (!audioContext || interactionEnded) {
+          return;
+        }
+
+        interactionEnded = true;
+
+        stateText.innerText = "CHANGED";
+
+        //
+        // FADE LEFT + RIGHT AWAY
+        //
+
+        smoothGain(leftGain, 0, 1.5);
+
+        smoothGain(rightGain, 0, 1.5);
+
+        //
+        // CENTRE RETURNS...
+        // BUT NOT EXACTLY AS BEFORE
+        //
+
+        smoothGain(centerGain, 0.58, 1.5);
+
+        //
+        // WORK OUT HOW PERSON INTERACTED
+        //
+
+        const averageEdge =
+          interactionFrames > 0
+            ? accumulatedEdgeDistance / interactionFrames
+            : 0;
+
+        //
+        // ALTER CENTRE SOUND
+        // BASED ON THEIR INTERACTION
+        //
+
+        const finalPitch = 1 + maximumDepth * 0.1 + averageEdge * 0.05;
+
+        audio.center.playbackRate = clamp(finalPitch, 1, 1.15);
+
+        //
+        // MORE ECHO THAN ORIGINAL STATE
+        //
+
+        delayFeedback.gain.setTargetAtTime(
+          0.28,
+
+          audioContext.currentTime,
+
+          1.5,
+        );
+
+        delayGain.gain.setTargetAtTime(
+          0.18,
+
+          audioContext.currentTime,
+
+          1.5,
+        );
+
+        pitchText.innerText =
+          "Final pitch: " + audio.center.playbackRate.toFixed(2) + "x";
+      }
+
+      //
+      // ==========================================
+      // MEDIAPIPE
+      // ==========================================
+      //
+
+      const pose = new Pose({
+        locateFile: (file) => {
+          return "https://cdn.jsdelivr.net/npm/@mediapipe/pose/" + file;
+        },
+      });
+
+      pose.setOptions({
+        modelComplexity: 1,
+
+        smoothLandmarks: true,
+
+        enableSegmentation: false,
+
+        minDetectionConfidence: 0.55,
+
+        minTrackingConfidence: 0.55,
+      });
+
+      pose.onResults(onPoseResults);
+
+      //
+      // ==========================================
+      // TRACK BODY
+      // ==========================================
+      //
+
+      function onPoseResults(results) {
+        const now = performance.now();
+
+        //
+        // NO BODY
+        //
+
+        if (!results.poseLandmarks) {
+          bodyPresent = false;
+
+          //
+          // BEFORE ANYONE HAS INTERACTED
+          //
+
+          if (!interactionStarted) {
+            setOriginalState();
+          }
+
+          //
+          // AFTER SOMEONE HAS INTERACTED
+          //
+          else if (!interactionEnded && now - lastBodySeen > leaveDelay) {
+            setChangedState();
+          }
+
+          return;
+        }
+
+        //
+        // BODY FOUND
+        //
+
+        bodyPresent = true;
+
+        lastBodySeen = now;
+
+        //
+        // FIRST TIME PERSON APPEARS
+        //
+
+        if (!interactionStarted) {
+          interactionStarted = true;
+
+          stateText.innerText = "INTERACTION";
+        }
+
+        //
+        // IF FINAL STATE HAS ALREADY HAPPENED
+        // DON'T START AGAIN
+        //
+
+        if (interactionEnded) {
+          return;
+        }
+
+        //
+        // SHOULDERS
+        //
+
+        const leftShoulder = results.poseLandmarks[11];
+
+        const rightShoulder = results.poseLandmarks[12];
+
+        //
+        // DEPTH
+        //
+
+        const dx = leftShoulder.x - rightShoulder.x;
+
+        const dy = leftShoulder.y - rightShoulder.y;
+
+        const rawDepth = Math.sqrt(dx * dx + dy * dy);
+
+        //
+        // BODY X
+        //
+
+        let rawX = (leftShoulder.x + rightShoulder.x) / 2;
+
+        // match mirrored webcam
+
+        rawX = 1 - rawX;
+
+        //
+        // SMOOTH TRACKING
+        //
+
+        smoothX += (rawX - smoothX) * smoothing;
+
+        smoothDepth += (rawDepth - smoothDepth) * smoothing;
+
+        //
+        // UPDATE SOUND
+        //
+
+        updateInteractionAudio(smoothX, smoothDepth);
+
+        //
+        // LABEL POSITION
+        //
+
+        let horizontalState;
+
+        if (smoothX < 0.35) {
+          horizontalState = "LEFT";
+        } else if (smoothX > 0.65) {
+          horizontalState = "RIGHT";
+        } else {
+          horizontalState = "CENTER";
+        }
+
+        //
+        // DEPTH LABEL
+        //
+
+        let depthState;
+
+        if (smoothDepth < 0.2) {
+          depthState = "FAR";
+        } else if (smoothDepth < 0.3) {
+          depthState = "MEDIUM";
+        } else if (smoothDepth < 0.42) {
+          depthState = "CLOSE";
+        } else {
+          depthState = "VERY CLOSE";
+        }
+
+        stateText.innerText = horizontalState + " / " + depthState;
+
+        depthText.innerText = "Depth: " + smoothDepth.toFixed(3);
+
+        xText.innerText = "Horizontal: " + smoothX.toFixed(3);
+
+        const centreDistance = Math.abs(smoothX - 0.5) / 0.5;
+
+        centerText.innerText =
+          "Distance from centre: " + centreDistance.toFixed(3);
+
+        //
+        // TEST VISUAL
+        //
+
+        const scale = clamp(
+          mapValue(smoothDepth, 0.1, 0.5, 0.4, 2),
+
+          0.4,
+          2,
+        );
+
+        visual.style.transform = `scale(${scale})`;
+
+        visual.style.opacity = clamp(
+          mapValue(smoothDepth, 0.1, 0.5, 0.2, 1),
+          0.2,
+          1,
+        );
+      }
+
+      //
+      // ==========================================
+      // START
+      // ==========================================
+      //
+
+      startButton.addEventListener("click", async () => {
+        startButton.style.display = "none";
+
+        //
+        // CREATE AUDIO CONTEXT
+        //
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+        //
+        // AUDIO SOURCES
+        //
+
+        leftSource = audioContext.createMediaElementSource(audio.left);
+
+        centerSource = audioContext.createMediaElementSource(audio.center);
+
+        rightSource = audioContext.createMediaElementSource(audio.right);
+
+        //
+        // GAINS
+        //
+
+        leftGain = audioContext.createGain();
+
+        centerGain = audioContext.createGain();
+
+        rightGain = audioContext.createGain();
+
+        leftGain.gain.value = 0;
+
+        centerGain.gain.value = 0.45;
+
+        rightGain.gain.value = 0;
+
+        //
+        // STEREO POSITION
+        //
+
+        leftPan = audioContext.createStereoPanner();
+
+        centerPan = audioContext.createStereoPanner();
+
+        rightPan = audioContext.createStereoPanner();
+
+        leftPan.pan.value = -0.8;
+
+        centerPan.pan.value = 0;
+
+        rightPan.pan.value = 0.8;
+
+        //
+        // MASTER
+        //
+
+        masterGain = audioContext.createGain();
+
+        masterGain.gain.value = 0.8;
+
+        //
+        // DELAY / SPACE
+        //
+
+        delayNode = audioContext.createDelay(1);
+
+        delayNode.delayTime.value = 0.28;
+
+        delayFeedback = audioContext.createGain();
+
+        delayFeedback.gain.value = 0.05;
+
+        delayGain = audioContext.createGain();
+
+        delayGain.gain.value = 0.04;
+
+        //
+        // CONNECT LEFT
+        //
+
+        leftSource.connect(leftGain);
+
+        leftGain.connect(leftPan);
+
+        leftPan.connect(masterGain);
+
+        //
+        // CONNECT CENTER
+        //
+
+        centerSource.connect(centerGain);
+
+        centerGain.connect(centerPan);
+
+        centerPan.connect(masterGain);
+
+        //
+        // CONNECT RIGHT
+        //
+
+        rightSource.connect(rightGain);
+
+        rightGain.connect(rightPan);
+
+        rightPan.connect(masterGain);
+
+        //
+        // SEND ALL SOUNDS TO DELAY
+        //
+
+        leftPan.connect(delayNode);
+
+        centerPan.connect(delayNode);
+
+        rightPan.connect(delayNode);
+
+        delayNode.connect(delayGain);
+
+        delayNode.connect(delayFeedback);
+
+        delayFeedback.connect(delayNode);
+
+        delayGain.connect(masterGain);
+
+        masterGain.connect(audioContext.destination);
+
+        //
+        // START ALL SOUNDS TOGETHER
+        //
+        // VERY IMPORTANT:
+        // they stay synchronised
+        //
+
+        try {
+          await Promise.all([
+            audio.left.play(),
+
+            audio.center.play(),
+
+            audio.right.play(),
+          ]);
+        } catch (error) {
+          console.log("Audio start error:", error);
+        }
+
+        //
+        // START IN ORIGINAL STATE
+        //
+
+        setOriginalState();
+
+        //
+        // CAMERA
+        //
+
+        const camera = new Camera(video, {
+          onFrame: async () => {
+            await pose.send({
+              image: video,
+            });
+          },
+
+          width: 1280,
+
+          height: 720,
+        });
+
+        camera.start();
+      });
+    </script>
+  </body>
+</html>
